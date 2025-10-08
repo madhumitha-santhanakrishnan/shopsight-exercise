@@ -24,7 +24,7 @@ BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 st.sidebar.title("ShopSight Settings")
 st.sidebar.caption("Tweak runtime options for the demo.")
 
-demo_mode = st.sidebar.toggle("Demo mode", value=True, help="Use cached/mocked responses when possible.")
+demo_mode = st.sidebar.toggle("Demo mode", value=True, help="Use mocked responses when possible.")
 model_name = st.sidebar.text_input("LLM model", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 backend_url = st.sidebar.text_input("Backend URL", BACKEND_URL)
 
@@ -361,11 +361,45 @@ with tab_forecast:
 
 with tab_insights:
     st.subheader("Insights")
-    st.caption("AI-generated summary of trends and risks.")
-    st.button("Generate insights", key="btn_insights")
-    st.info("We’ll call /insights to produce a concise narrative here.", icon="💡")
-    with st.expander("Prompt Inspector (transparency)"):
-        st.code("<!-- prompt and variables will show here once wired -->", language="markdown")
+    st.caption("AI-generated summary of recent trends, forecast, and next actions.")
+
+    c1, c2, c3, c4 = st.columns([0.34, 0.22, 0.22, 0.22])
+    with c1:
+        pid_i = st.text_input("Product ID", value=st.session_state.get("sales_product", ""), placeholder="e.g., 508929006")
+    with c2:
+        grain_i = st.selectbox("Grain", ["day", "week", "month"], index=1, key="ins_grain")
+    with c3:
+        metric_i = st.selectbox("Metric", ["units", "revenue"], index=0, key="ins_metric")
+    with c4:
+        horizon_i = st.slider("Horizon", min_value=4, max_value=16, value=8, step=1, key="ins_h")
+
+    run_i = st.button("Generate insights", type="primary", key="btn_insights")
+    st.divider()
+
+    if run_i and pid_i.strip():
+        body = {
+            "product_id": pid_i.strip(),
+            "grain": grain_i,
+            "metric": metric_i,
+            "horizon": horizon_i,
+            "model": model_name,
+            "demo_mode": demo_mode,
+        }
+        with st.spinner("Thinking…"):
+            try:
+                r = requests.post(f"{backend_url}/insights", json=body, timeout=90)
+                if not r.ok:
+                    st.error(f"/insights error {r.status_code}: {r.text}")
+                else:
+                    payload = r.json()
+                    st.markdown(payload.get("insight_markdown", "_No insight returned._"))
+                    with st.expander("Inspect Prompt"):
+                        st.code(payload.get("prompt_used", ""), language="markdown")
+                    st.caption(f"Model: {payload.get('model_used', 'unknown')}")
+            except Exception as e:
+                st.error(f"Request failed: {e}")
+    else:
+        st.info("Pick a product and click **Generate insights**.", icon="💡")
 
 with tab_assistant:
     st.subheader("Assistant (Agent)")

@@ -18,6 +18,13 @@ from core.queries import sales_history
 from statsforecast import StatsForecast
 from statsforecast.models import Naive, SeasonalNaive
 
+import os
+import json
+from openai import OpenAI
+from textwrap import dedent
+
+from dotenv import load_dotenv 
+load_dotenv() 
 
 app = FastAPI(title="ShopSight API", version="0.1.0")
 
@@ -82,6 +89,19 @@ class ForecastResponse(BaseModel):
     level: List[int]
     points: List[ForecastPoint]
 
+class InsightsRequest(BaseModel):
+    product_id: str
+    grain: Literal["day", "week", "month"] = "week"
+    metric: Literal["units", "revenue"] = "units"
+    horizon: int = 8
+    model: Optional[str] = None
+    demo_mode: bool = False # if true, or no API key -> mock summary
+
+class InsightsResponse(BaseModel):
+    model_used: str
+    insight_markdown: str
+    prompt_used: str
+
 def _season_length(grain: str) -> int:
     g = (grain or "week").lower()
     if g == "day":
@@ -89,6 +109,60 @@ def _season_length(grain: str) -> int:
     if g == "month":
         return 12 
     return 52 # default to weekly
+
+def _summarize_series_for_prompt(hist_df: pd.DataFrame, fc_df: pd.DataFrame, metric: str) -> dict:
+    """Return small dict of stats + compact tables to keep the prompt lean."""
+    hist_tail = (
+        hist_df.sort_values("period_start")
+               .tail(12)[["period_start", metric]]
+               .rename(columns={"period_start": "ds", metric: "y"})
+    )
+    fc_tail = (
+        fc_df[["ds", "yhat", "lo80", "hi80", "lo95", "hi95"]]
+        .head(8)
+    )
+    summary = {
+        "history_tail": hist_tail.assign(ds=hist_tail["ds"].astype(str)).to_dict(orient="records"),
+        "forecast_head": fc_tail.assign(ds=fc_tail["ds"].astype(str)).to_dict(orient="records"),
+        "history_n": int(len(hist_df)),
+        "metric": metric,
+        "recent_mean": float(hist_df[metric].tail(12).mean()) if len(hist_df) else 0.0,
+        "recent_std": float(hist_df[metric].tail(12).std(ddof=0)) if len(hist_df) else 0.0,
+        "overall_mean": float(hist_df[metric].mean()) if len(hist_df) else 0.0,
+    }
+    return summary
+
+def _build_insights_prompt(product_meta: dict | None, grain: str, metric: str, stats: dict) -> str:
+    name = (product_meta or {}).get("product_name") or ""
+    brand = (product_meta or {}).get("brand") or ""
+    ptype = (product_meta or {}).get("product_type") or ""
+    header = f"Product: {name}".strip() or "Selected product"
+    brand_line = f"Brand: {brand}" if brand else ""
+    type_line = f"Type: {ptype}" if ptype else ""
+
+    return dedent(f"""
+    You are an e-commerce analytics assistant. Write a concise, executive-friendly insight
+    about the time series below.
+
+    {header}
+    {brand_line}
+    {type_line}
+
+    Grain: {grain}
+    Metric: {metric}
+
+    DATA (compact JSON):
+    {json.dumps(stats, ensure_ascii=False, indent=2)}
+
+    INSTRUCTIONS:
+    - First, 1 short paragraph (2–4 sentences) describing recent trend, volatility, and any seasonality.
+    - Then, exactly 3 bullet points:
+      • one on the forecast level & direction (mention the horizon),
+      • one on risk/uncertainty using the prediction intervals,
+      • one recommended action (clear and non-technical).
+    - Avoid repeating raw numbers excessively; pick only the most salient.
+    - Audience is business users; keep it plain and crisp.
+    """).strip()
 
 @app.get("/health", response_model=HealthResponse)
 def healthcheck() -> HealthResponse:
@@ -200,3 +274,95 @@ def post_forecast(req: ForecastRequest):
         points.append(obj)
 
     return ForecastResponse(horizon=req.horizon, level=req.level, points=points)
+
+@app.post("/insights", response_model=InsightsResponse)
+def post_insights(req: InsightsRequest):
+    """
+    Generate a short narrative about history + forecast using OpenAI.
+    """
+    # 1) History (reuse sales query)
+    sql, params = sales_history(product_id=req.product_id, grain=req.grain)
+    hist = run_sql(sql, params)
+    if hist.empty:
+        return InsightsResponse(
+            model_used="mock",
+            insight_markdown="No history found for this selection.",
+            prompt_used="(no prompt – empty history)",
+        )
+    hist["period_start"] = pd.to_datetime(hist["period_start"])
+    hist = hist.sort_values("period_start")
+
+    # 2) Forecast (reuse in-process call)
+    series = [{"ds": d.strftime("%Y-%m-%d"), "y": float(v)}
+              for d, v in zip(hist["period_start"], hist[req.metric])]
+    # Build a tiny request DataFrame then reuse our forecast logic
+    fc_req = ForecastRequest(
+        series=[TSPoint(ds=pd.to_datetime(s["ds"]).date(), y=s["y"]) for s in series],
+        horizon=req.horizon,
+        level=[80, 95],
+        grain=req.grain,
+    )
+    fc_resp: ForecastResponse = post_forecast(fc_req)  # call our own endpoint function
+    fc = pd.DataFrame([p.dict() for p in fc_resp.points])
+    fc["ds"] = pd.to_datetime(fc["ds"])
+
+    # 3) Product metadata (nice touch for context)
+    meta_df = run_sql(
+        "SELECT product_id, product_name, brand, product_type FROM products WHERE product_id = ? LIMIT 1;",
+        (req.product_id,),
+    )
+    meta = None if meta_df.empty else meta_df.iloc[0].to_dict()
+
+    # 4) Build prompt materials
+    stats = _summarize_series_for_prompt(hist_df=hist, fc_df=fc, metric=req.metric)
+    prompt = _build_insights_prompt(product_meta=meta, grain=req.grain, metric=req.metric, stats=stats)
+
+    # 5) Decide model / fallback
+    model = req.model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    api_key = os.getenv("OPENAI_API_KEY", "")
+
+    use_mock = req.demo_mode or not api_key or OpenAI is None
+    reason = []
+    if req.demo_mode: reason.append("demo_mode")
+    if not api_key:   reason.append("no_api_key")
+    if OpenAI is None: reason.append("openai_sdk_missing")
+    print("[/insights] mode:", "mock" if use_mock else "live", "| reasons:", ", ".join(reason) or "—")
+
+    if use_mock:
+        # Deterministic, no-network summary
+        recent = stats["recent_mean"]
+        direction = "stable" if stats["recent_std"] < 0.1 * max(recent, 1.0) else "variable"
+        mock = dedent(f"""
+        Recent performance is **{direction}** with average {req.metric} ≈ {recent:.1f} per {req.grain}.
+        The short-term forecast remains within historical ranges.
+
+        - **Outlook:** Next {req.horizon} {req.grain}s are expected to track recent levels with modest variation.
+        - **Uncertainty:** Prediction intervals widen slightly; watch for weekly swings around promotions.
+        - **Action:** Align inventory to the forecast range and test a small price/promo to tighten variability.
+        """).strip()
+        return InsightsResponse(model_used="mock", insight_markdown=mock, prompt_used=prompt)
+
+    # 6) Live call to OpenAI
+    try:
+        client = OpenAI(api_key=api_key)
+        chat = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a crisp analytics writer for business users."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+        )
+        text = chat.choices[0].message.content.strip()
+        return InsightsResponse(model_used=model, insight_markdown=text, prompt_used=prompt)
+    except Exception as e:
+        # Safe fallback if the model call fails
+        fallback = f"_LLM call failed ({e}). Showing mock summary instead._\n\n"
+        recent = stats["recent_mean"]
+        mock = dedent(f"""
+        Recent performance is **steady** with average {req.metric} ≈ {recent:.1f} per {req.grain}.
+        - **Outlook:** Next {req.horizon} {req.grain}s are expected to follow recent levels.
+        - **Uncertainty:** Prediction intervals indicate moderate variability.
+        - **Action:** Keep inventory aligned to the median forecast and monitor anomalies.
+        """).strip()
+        return InsightsResponse(model_used="mock", insight_markdown=fallback + mock, prompt_used=prompt)
