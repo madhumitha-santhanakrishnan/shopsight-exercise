@@ -1,0 +1,9 @@
+streamlit
+plotly
+duckdb
+pandas
+fastapi
+uvicorn
+pydantic
+python-dotenv
+openai
