@@ -5,9 +5,9 @@ from pydantic import BaseSettings
 
 class Settings(BaseSettings):
     openai_api_key: str | None = None
-    # openai_model: str = "gpt-4o-mini"
+    openai_model: str = "gpt-4o-mini"
     s3_base: str = "s3://kumo-public-datasets/hm_with_images/"
-    # demo_mode: bool = True # for dev/demo
+    demo_mode: bool = True # for dev/demo
     backend_url: str = "http://localhost:8000"
 
     class Config:

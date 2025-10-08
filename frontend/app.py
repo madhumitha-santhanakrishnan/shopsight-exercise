@@ -36,7 +36,6 @@ def _select_pid(pid: str):
 
 st.sidebar.divider()
 st.sidebar.write("**About:** ShopSight is a search-driven analytics prototype for e-commerce.")
-st.sidebar.write("Ask for sales, forecasts, and insights using natural language.")
 
 
 def ping_health(url: str) -> bool:
