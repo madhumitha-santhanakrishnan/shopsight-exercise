@@ -501,7 +501,8 @@ def search_products_endpoint(
     if not nl:
         sql, params = _structured_search_sql()
         params = {"q": q_like, "limit": limit}
-        df = run_sql(sql, params)
+        sql_exec, param_list = _to_positional(sql, q_like, limit)
+        df = run_sql(sql_exec, param_list)
         rows = [SearchResponseRow(**{k: str(v) if v is not None else "" for k, v in r.items()})
                 for r in df.to_dict("records")]
         return SearchResponse(mode="structured", display_sql=pretty_sql(sql, params), rows=rows)
