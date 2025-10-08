@@ -69,7 +69,7 @@ Note: If you don’t set an OpenAI key, the app runs in demo/mock mode: all LLM 
 - **Mocked:** LLM summaries (when DEMO_MODE=True or no API key). What-if simulator uses heuristic text rules.
 
 ## Time spent
-Roughly 3.5–4 hours across setup, data connection, testing connection, sales + forecast flow, LLM integration, and polish.
+Roughly 3.5–4 hours across setup, data connection, testing connection, sales + forecast flow, LLM integration, and polish. I completed this exercise over a few focused work sessions.
 
 ## What I would build next
 - Explain forecast: Button on the forecast tab that calls `/llm/explain_forecast` to describe the chart in plain english ("For example, sales have stabilized after winter peaks...")
