@@ -181,10 +181,183 @@ with tab_sales:
 
 with tab_forecast:
     st.subheader("Forecast")
-    st.caption("Demand forecast with confidence intervals.")
-    st.slider("Horizon (weeks)", min_value=4, max_value=16, value=8, step=1, key="horizon")
-    st.toggle("Show 80% / 95% bands", value=True, key="bands")
-    st.warning("We’ll compute and plot forecasts once /forecast is ready.", icon="🧮")
+    st.caption("Demand forecast with confidence intervals overlaid on history.")
+
+    # Controls
+    c1, c2, c3 = st.columns([0.35, 0.30, 0.35])
+    with c1:
+        product_id_input_fc = st.text_input(
+            "Product ID",
+            value=st.session_state.get("sales_product", ""),
+            placeholder="e.g., 508929006",
+            help="Pick a product_id that has sales (copy from Sales tab).",
+            key="fc_pid",
+        )
+    with c2:
+        grain_fc = st.selectbox("Grain", ["day", "week", "month"], index=1, key="fc_grain")
+    with c3:
+        metric_fc = st.radio("Metric", ["units", "revenue"], horizontal=True, key="fc_metric")
+
+    c4, c5, c6 = st.columns([0.33, 0.33, 0.34])
+    with c4:
+        horizon = st.slider("Horizon (periods)", min_value=4, max_value=16, value=8, step=1, key="fc_h")
+    with c5:
+        show_bands = st.toggle("Show 80% / 95% bands", value=True, key="fc_bands")
+    with c6:
+        overlay_history = st.toggle("Overlay history", value=True, key="fc_overlay")
+
+    run_btn = st.button("Compute forecast", type="primary", key="btn_fc")
+
+    st.divider()
+
+    import pandas as pd
+    import plotly.graph_objects as go
+    # Action
+    if run_btn and product_id_input_fc.strip():
+        try:
+            # 1) Pull aggregated sales for history
+            sales_params = {"product_id": product_id_input_fc.strip(), "grain": grain_fc}
+            with st.spinner("Fetching sales…"):
+                r1 = requests.get(f"{backend_url}/sales", params=sales_params, timeout=30)
+            if not r1.ok:
+                st.error(f"/sales error {r1.status_code}: {r1.text}")
+                st.stop()
+
+            payload = r1.json()
+            rows = payload.get("rows", [])
+            if not rows:
+                st.info("No sales found. Try another product_id or different grain.")
+                st.stop()
+
+
+            hist = pd.DataFrame(rows)
+            hist["period_start"] = pd.to_datetime(hist["period_start"])
+            hist = hist.sort_values("period_start")
+
+            if len(hist) < 6:
+                st.info("Not enough history to forecast reliably. Try a different product or grain.")
+                st.stop()
+            
+            if grain_fc == "day" and len(hist) > 300:
+                st.warning("Daily data is dense — aggregating to weekly for clarity.", icon="⚠️")
+                hist = (
+                    hist.set_index("period_start")
+                        .resample("W")
+                        .agg({metric_fc: "sum"}) # Aggregate to weekly sums for readability
+                        .reset_index()
+                )
+                grain_fc = "week"
+
+            show_markers = len(hist) < 200
+            mode_hist = "lines+markers" if show_markers else "lines"
+
+            # 2) Prepare series for /forecast as [{ds, y}]
+            series = [{"ds": d.strftime("%Y-%m-%d"), "y": float(v)}
+                      for d, v in zip(hist["period_start"], hist[metric_fc])]
+
+            # 3) Call /forecast
+            req_body = {"series": series, "horizon": horizon, "level": [80, 95], "grain": grain_fc}
+            with st.spinner("Computing forecast…"):
+                r2 = requests.post(f"{backend_url}/forecast", json=req_body, timeout=60)
+            if not r2.ok:
+                st.error(f"/forecast error {r2.status_code}: {r2.text}")
+                st.stop()
+
+            fc = pd.DataFrame(r2.json().get("points", []))
+            if fc.empty:
+                st.info("Forecast returned no points.")
+                st.stop()
+            fc["ds"] = pd.to_datetime(fc["ds"])
+            fc = fc.sort_values("ds")
+            mode_fc   = "lines+markers" if len(fc) < 200 else "lines"
+
+            # Plotly chart with history + forecast + confidence bands
+            color_hist = "#2563EB"   # blue-600
+            color_fc   = "#0EA5E9"   # sky-500
+            color80    = "rgba(14,165,233,0.20)"  # 20% opacity
+            color95    = "rgba(14,165,233,0.10)"  # 10% opacity
+
+            fig = go.Figure()
+
+            # Bands (95% and 80%)
+            if show_bands and {"lo95","hi95"}.issubset(fc.columns):
+                fig.add_trace(go.Scatter(
+                    x=pd.concat([fc["ds"], fc["ds"][::-1]]),
+                    y=pd.concat([fc["hi95"], fc["lo95"][::-1]]),
+                    fill="toself", fillcolor=color95, line=dict(width=0),
+                    hoverinfo="skip", showlegend=True, name="95% PI", legendgroup="pi",
+                ))
+            if show_bands and {"lo80","hi80"}.issubset(fc.columns):
+                fig.add_trace(go.Scatter(
+                    x=pd.concat([fc["ds"], fc["ds"][::-1]]),
+                    y=pd.concat([fc["hi80"], fc["lo80"][::-1]]),
+                    fill="toself", fillcolor=color80, line=dict(width=0),
+                    hoverinfo="skip", showlegend=True, name="80% PI", legendgroup="pi",
+                ))
+
+            # History line
+            if overlay_history:
+                fig.add_trace(go.Scatter(
+                    x=hist["period_start"], y=hist[metric_fc],
+                    mode=mode_hist,
+                    name=f"History ({metric_fc})",
+                    line=dict(width=2, color=color_hist),
+                    marker=dict(size=5, color=color_hist),
+                    legendgroup="main",
+                    hovertemplate="%{x|%b %d, %Y}<br>"+metric_fc.title()+": %{y:.0f}<extra></extra>",
+                ))
+
+            # Forecast mean
+            fig.add_trace(go.Scatter(
+                x=fc["ds"], y=fc["yhat"],
+                mode=mode_fc,
+                name="Forecast",
+                line=dict(width=2, color=color_fc, dash="dash"),
+                marker=dict(size=5, color=color_fc),
+                legendgroup="main",
+                hovertemplate="%{x|%b %d, %Y}<br>Forecast: %{y:.0f}<extra></extra>",
+            ))
+
+            # Vertical guide at forecast start (last history point)
+            split_x = hist["period_start"].max()
+            fig.add_vline(x=split_x, line_dash="dot", line_color="#9CA3AF", opacity=0.7)
+            fig.add_annotation(x=split_x, y=1, yref="paper", yanchor="bottom",
+                               text="Forecast starts", showarrow=False, xanchor="left",
+                               font=dict(size=11, color="#6B7280"))
+
+            fig.update_layout(
+                title=f"Forecast • {product_id_input_fc}",
+                xaxis_title="Period start",
+                yaxis_title=metric_fc.title(),
+                hovermode="x unified",
+                yaxis=dict(rangemode="tozero"),
+                legend=dict(orientation="v", x=1.02, y=1.0, bgcolor="rgba(255,255,255,0)"),
+                margin=dict(t=60, r=110, b=40, l=50),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Downloads + SQL
+            hist_out = hist.rename(columns={"period_start":"ds", metric_fc:"y"})
+            st.download_button(
+                "Download history (CSV)",
+                hist_out.to_csv(index=False).encode("utf-8"),
+                file_name=f"history_{product_id_input_fc}_{grain_fc}_{metric_fc}.csv",
+                mime="text/csv",
+            )
+            st.download_button(
+                "Download forecast (CSV)",
+                fc.to_csv(index=False).encode("utf-8"),
+                file_name=f"forecast_{product_id_input_fc}_{grain_fc}_{metric_fc}.csv",
+                mime="text/csv",
+            )
+            with st.expander("Show SQL used for history"):
+                st.code(payload.get("display_sql", "--"), language="sql")
+
+        except Exception as e:
+            st.error(f"Forecast flow failed: {e}")
+    else:
+        st.info("Enter a product_id and click **Compute forecast** to see the overlay.", icon="ℹ️")
+
 
 with tab_insights:
     st.subheader("Insights")
@@ -202,4 +375,4 @@ with tab_assistant:
     st.info("The /agent/run endpoint will plan tool calls and return results here.", icon="🤖")
 
 st.divider()
-st.caption("© ShopSight – Prototype for take-home assessment.")
+st.caption("© ShopSight 2025")

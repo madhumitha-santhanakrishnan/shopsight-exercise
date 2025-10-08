@@ -7,13 +7,17 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import date
-from typing import List, Optional
+from typing import List, Optional, Literal
 
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 
 from core.duck import run_sql, pretty_sql
 from core.queries import sales_history
+
+from statsforecast import StatsForecast
+from statsforecast.models import Naive, SeasonalNaive
+
 
 app = FastAPI(title="ShopSight API", version="0.1.0")
 
@@ -45,6 +49,46 @@ class ProductInfo(BaseModel):
     product_name: str
     brand: Optional[str] = ""
     product_type: Optional[str] = ""
+
+class TSPoint(BaseModel):
+    """
+    A single time series data point with a date string (ISO) (ds) and a value (y).
+    """
+    ds: date
+    y: float
+
+class ForecastRequest(BaseModel):
+    series: List[TSPoint] = Field(..., description="Historic series: list of {ds, y}")
+    horizon: int = Field(8, ge=1, le=52, description="Number of future periods to forecast")
+    level: List[int] = Field(default_factory=lambda: [80, 95], description="Prediction interval levels")
+    grain: Literal["day", "week", "month"] = "week"
+
+    @validator("series")
+    def non_empty_series(cls, v):
+        if not v:
+            raise ValueError("series must be a non-empty list")
+        return v
+
+class ForecastPoint(BaseModel):
+    ds: str
+    yhat: float
+    lo80: Optional[float] = None
+    hi80: Optional[float] = None
+    lo95: Optional[float] = None
+    hi95: Optional[float] = None
+
+class ForecastResponse(BaseModel):
+    horizon: int
+    level: List[int]
+    points: List[ForecastPoint]
+
+def _season_length(grain: str) -> int:
+    g = (grain or "week").lower()
+    if g == "day":
+        return 7     
+    if g == "month":
+        return 12 
+    return 52 # default to weekly
 
 @app.get("/health", response_model=HealthResponse)
 def healthcheck() -> HealthResponse:
@@ -113,3 +157,46 @@ def get_product(product_id: str):
         brand=str(r.get("brand", "") or ""),
         product_type=str(r.get("product_type", "") or ""),
     )
+
+@app.post("/forecast", response_model=ForecastResponse)
+def post_forecast(req: ForecastRequest):
+    """
+    Generate a forecast for the given: univariate time series with SeasonalNaive model.
+    """
+    df = pd.DataFrame([{"ds": p.ds, "y": p.y} for p in req.series])
+    df["ds"] = pd.to_datetime(df["ds"])
+    df = df.sort_values("ds")
+    df["unique_id"] = "series-1"
+
+    m = _season_length(req.grain)
+    models = [SeasonalNaive(season_length=m)]
+
+    # If we have too little data, we fall back to Naive model
+    if len(df) < m:
+        models = [Naive()]
+    
+    frequency_map = {"day": "D", "week": "W", "month": "MS"}
+    sf = StatsForecast(models=models, freq=frequency_map[req.grain])
+
+    fcst = sf.forecast(df=df, h=req.horizon, level=req.level).reset_index(drop=True)
+
+    model_name = models[0].__class__.__name__                
+    mean_col = model_name  
+
+    points: List[ForecastPoint] = []
+    for _, row in fcst.iterrows():
+        obj = ForecastPoint(
+            ds=pd.to_datetime(row["ds"]).date().isoformat(),
+            yhat=float(row[mean_col]),
+        )
+        
+        for lvl in req.level:
+            lo_col = f"{model_name}-lo-{lvl}"
+            hi_col = f"{model_name}-hi-{lvl}"
+            if lo_col in fcst.columns:
+                setattr(obj, f"lo{lvl}", float(row[lo_col]))
+            if hi_col in fcst.columns:
+                setattr(obj, f"hi{lvl}", float(row[hi_col]))
+        points.append(obj)
+
+    return ForecastResponse(horizon=req.horizon, level=req.level, points=points)
