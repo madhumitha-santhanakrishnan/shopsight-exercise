@@ -22,6 +22,7 @@ import os
 import json
 from openai import OpenAI
 from textwrap import dedent
+import re
 
 from dotenv import load_dotenv 
 load_dotenv() 
@@ -102,6 +103,17 @@ class InsightsResponse(BaseModel):
     insight_markdown: str
     prompt_used: str
 
+class SearchResponseRow(BaseModel):
+    product_id: str
+    product_name: str
+    brand: Optional[str] = ""
+    product_type: Optional[str] = ""
+
+class SearchResponse(BaseModel):
+    mode: Literal["nlsql", "structured"]
+    display_sql: str
+    rows: list[SearchResponseRow]
+
 def _season_length(grain: str) -> int:
     g = (grain or "week").lower()
     if g == "day":
@@ -163,6 +175,98 @@ def _build_insights_prompt(product_meta: dict | None, grain: str, metric: str, s
     - Avoid repeating raw numbers excessively; pick only the most salient.
     - Audience is business users; keep it plain and crisp.
     """).strip()
+
+def _generate_schema() -> str:
+    return dedent("""
+    You are generating DuckDB SQL for a read-only e-commerce dataset.
+
+    Tables:
+      products(product_id VARCHAR, product_name TEXT, product_type TEXT, brand TEXT)
+      transactions(product_id VARCHAR, t_dat DATE, price DOUBLE)
+
+    Requirements:
+    - Output a single SELECT statement only.
+    - Return columns: product_id, product_name, brand, product_type.
+    - Prefer ranking by recent popularity when it helps (e.g., last 90 days transactions).
+    - Put a LIMIT :limit at the end (use named parameters :q and :limit).
+    - Never use DDL/DML (no CREATE/ALTER/INSERT/DELETE/UPDATE/ATTACH/PRAGMA/etc.).
+    - Keep it simple and robust.
+
+    Examples:
+
+    -- Query: "Nike running shoes"
+    SELECT p.product_id, p.product_name, p.brand, p.product_type
+    FROM products p
+    WHERE (p.product_name ILIKE :q OR p.brand ILIKE :q OR p.product_type ILIKE :q)
+    ORDER BY p.product_name
+    LIMIT :limit;
+
+    -- Query: "top adidas sneakers recently"
+    WITH recent AS (
+      SELECT product_id, COUNT(*) AS n
+      FROM transactions
+      WHERE t_dat >= CURRENT_DATE - INTERVAL 90 DAY
+      GROUP BY 1
+    )
+    SELECT p.product_id, p.product_name, p.brand, p.product_type
+    FROM products p
+    LEFT JOIN recent r USING(product_id)
+    WHERE (p.brand ILIKE '%adidas%' OR p.product_name ILIKE '%adidas%')
+      AND (p.product_type ILIKE '%sneaker%' OR p.product_name ILIKE '%sneaker%')
+    ORDER BY COALESCE(r.n, 0) DESC, p.product_name
+    LIMIT :limit;
+    """).strip()
+
+_BLOCKLIST = re.compile(
+    r"\b(create|alter|drop|insert|update|delete|truncate|merge|replace|grant|revoke|vacuum|pragma|load|install|set|attach|copy)\b",
+    re.IGNORECASE,
+)
+
+def _is_safe_select(sql: str) -> bool:
+    s = sql.strip().rstrip(";")
+    if not s.lower().startswith("select") and not s.lower().startswith("with"):
+        return False
+    if _BLOCKLIST.search(s):
+        return False
+    # No multiple statements
+    if ";" in sql.strip():
+        return False
+    # Restrict table names
+    if re.search(r"\binformation_schema\b|\bpg_\w+\b", s, flags=re.IGNORECASE):
+        return False
+    return True
+
+def _structured_search_sql() -> tuple[str, dict]:
+    sql = dedent("""
+        SELECT
+          product_id, product_name, brand, product_type
+        FROM products
+        WHERE product_name ILIKE :q
+           OR brand        ILIKE :q
+           OR product_type ILIKE :q
+        ORDER BY product_name
+        LIMIT :limit;
+    """).strip()
+    params = {}  # filled as per request
+    return sql, params
+
+_PARAM_RE = re.compile(r":(q|limit)\b", flags=re.IGNORECASE)
+
+def _to_positional(sql: str, q_like: str, limit: int) -> tuple[str, list]:
+    """
+    Replace :q / :limit with positional ? placeholders, building a params list in the exact textual order of appearance.
+    """
+    params: list = []
+    out = []
+    i = 0
+    for m in _PARAM_RE.finditer(sql):
+        out.append(sql[i:m.start()])
+        out.append("?")
+        name = m.group(1).lower()
+        params.append(q_like if name == "q" else limit)
+        i = m.end()
+    out.append(sql[i:])
+    return ("".join(out), params)
 
 @app.get("/health", response_model=HealthResponse)
 def healthcheck() -> HealthResponse:
@@ -366,3 +470,105 @@ def post_insights(req: InsightsRequest):
         - **Action:** Keep inventory aligned to the median forecast and monitor anomalies.
         """).strip()
         return InsightsResponse(model_used="mock", insight_markdown=fallback + mock, prompt_used=prompt)
+    
+@app.get("/search", response_model=SearchResponse)
+def search_products_endpoint(
+    q: str,
+    limit: int = 10,
+    nl: bool = True,           # when False → force structured fallback
+    demo_mode: bool = False,
+    model: Optional[str] = None,
+):
+    """
+    NL→SQL product search with guardrails. Falls back to structured ILIKE.
+    """
+    limit = max(1, min(limit, 50))
+    q_like = f"%{q}%"
+
+    # If NL disabled, go straight to fallback
+    if not nl:
+        sql, params = _structured_search_sql()
+        params = {"q": q_like, "limit": limit}
+        df = run_sql(sql, params)
+        rows = [SearchResponseRow(**{k: str(v) if v is not None else "" for k, v in r.items()})
+                for r in df.to_dict("records")]
+        return SearchResponse(mode="structured", display_sql=pretty_sql(sql, params), rows=rows)
+
+    # NL→SQL path (OpenAI with fallback)
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    chosen_model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    use_mock = demo_mode or not api_key or OpenAI is None
+
+    # 1) Make a candidate SQL (LLM or heuristic mock)
+    if use_mock:
+        # Heuristic: same as fallback, but we still call it "nlsql" to show the flow
+        draft_sql = dedent("""
+            SELECT product_id, product_name, brand, product_type
+            FROM products
+            WHERE (product_name ILIKE :q OR brand ILIKE :q OR product_type ILIKE :q)
+            ORDER BY product_name
+            LIMIT :limit
+        """).strip()
+    else:
+        sys = "You convert short product search queries into safe DuckDB SQL."
+        user = dedent(f"""
+            Query: {q}
+
+            { _generate_schema() }
+
+            Output only the SQL, no extra text:
+        """).strip()
+
+        try:
+            client = OpenAI(api_key=api_key)
+            chat = client.chat.completions.create(
+                model=chosen_model,
+                messages=[{"role": "system", "content": sys},
+                          {"role": "user", "content": user}],
+                temperature=0.1,
+            )
+            draft_sql = chat.choices[0].message.content.strip().strip("`")
+            # If the model returned fenced code, strip it
+            if draft_sql.lower().startswith("sql"):
+                draft_sql = re.sub(r"^sql\s*", "", draft_sql, flags=re.IGNORECASE).strip()
+        except Exception as e:
+            # LLM failed → use heuristic mock
+            draft_sql = dedent("""
+                SELECT product_id, product_name, brand, product_type
+                FROM products
+                WHERE (product_name ILIKE :q OR brand ILIKE :q OR product_type ILIKE :q)
+                ORDER BY product_name
+                LIMIT :limit
+            """).strip()
+
+    # 2) Validate & normalize the SQL
+    candidate = draft_sql.rstrip(";")
+    if not _is_safe_select(candidate):
+        # Guardrail tripped → fallback to structured
+        sql, params = _structured_search_sql()
+        params = {"q": q_like, "limit": limit}
+        mode = "structured"
+    else:
+        # Ensure it returns the required columns & has a limit param; if missing, append
+        if "limit" not in candidate.lower():
+            candidate += " LIMIT :limit"
+        sql = candidate
+        params = {"q": q_like, "limit": limit}
+        mode = "nlsql"
+
+    # 3) Execute
+    try:
+        sql_exec, param_list = _to_positional(sql, q_like, limit)
+        df = run_sql(sql_exec, param_list)
+    except Exception:
+        # Execution failed → fallback to structured
+        fb_sql, _ = _structured_search_sql() 
+        sql_exec, param_list = _to_positional(fb_sql, q_like, limit)
+        df = run_sql(sql_exec, param_list)
+        mode = "structured"
+        display_sql = pretty_sql(sql_exec, param_list)
+
+    # 4) Serialize
+    rows = [SearchResponseRow(**{k: str(v) if v is not None else "" for k, v in r.items()})
+            for r in df.to_dict("records")]
+    return SearchResponse(mode=mode, display_sql=pretty_sql(sql, params), rows=rows)

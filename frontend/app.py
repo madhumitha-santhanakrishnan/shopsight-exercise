@@ -28,6 +28,12 @@ demo_mode = st.sidebar.toggle("Demo mode", value=True, help="Use mocked response
 model_name = st.sidebar.text_input("LLM model", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 backend_url = st.sidebar.text_input("Backend URL", BACKEND_URL)
 
+def _select_pid(pid: str):
+    st.session_state["sales_product"] = pid
+    st.session_state["fc_pid"] = pid            
+    st.session_state["ins_pid"] = pid
+    st.session_state["just_selected_pid"] = pid
+
 st.sidebar.divider()
 st.sidebar.write("**About:** ShopSight is a search-driven analytics prototype for e-commerce.")
 st.sidebar.write("Ask for sales, forecasts, and insights using natural language.")
@@ -62,15 +68,84 @@ tab_search, tab_sales, tab_forecast, tab_insights, tab_assistant = st.tabs(
 
 with tab_search:
     st.subheader("Search for products")
-    st.caption("Try: *“Nike running shoes”*, *“Adidas sneakers last quarter”*")
-    query = st.text_input("What are you looking for?", value="", placeholder="e.g., Nike running shoes")
-    colA, colB = st.columns([0.2, 0.8])
-    with colA:
-        st.button("Search", type="primary", key="btn_search")
-    with colB:
-        st.toggle("Trust mode: NL→SQL", value=True, key="trust_toggle",
-                  help="If off, the app uses structured filters only.")
-    st.info("Results will appear here once we wire the /search endpoint.", icon="ℹ️")
+    st.caption("Try: *“Nike running shoes”*, *“Adidas sneakers”*")
+
+    colq, coll, colm = st.columns([0.6, 0.15, 0.25])
+    with colq:
+        query = st.text_input("What are you looking for?", value="", placeholder="e.g., Nike running shoes")
+    with coll:
+        limit = st.number_input("Limit", min_value=1, max_value=50, value=10, step=1)
+    with colm:
+        trust_nl = st.toggle(
+            "Trust mode: NL→SQL",
+            value=True,
+            help="If off, uses a structured ILIKE search."
+        )
+
+    run_search = st.button("Search", type="primary", key="btn_search")
+
+    st.divider()
+
+    if run_search and query.strip():
+        try:
+            params = {
+                "q": query.strip(),
+                "limit": int(limit),
+                "nl": bool(trust_nl),
+                "demo_mode": demo_mode,
+                "model": model_name,
+            }
+            with st.spinner("Searching…"):
+                r = requests.get(f"{backend_url}/search", params=params, timeout=30)
+            if not r.ok:
+                st.error(f"/search error {r.status_code}: {r.text}")
+            else:
+                payload = r.json()
+                rows = payload.get("rows", [])
+                mode = payload.get("mode", "structured")
+
+                if not rows:
+                    st.info("No matches found. Try fewer words or different terms.")
+                else:
+                    st.caption(f"Mode: **{mode}**")
+                    # st.markdown(f"**{len(rows)} products found.**")
+                    for i, row in enumerate(rows):
+                        with st.container(border=True):
+                            cA, cB, cC, cD = st.columns([0.45, 0.2, 0.2, 0.15])
+                            with cA:
+                                st.markdown(f"**{row.get('product_name','')}**")
+                                st.caption(f"ID: `{row.get('product_id','')}`")
+                            with cB:
+                                st.markdown("**Brand**")
+                                st.caption(row.get("brand","") or "—")
+                            with cC:
+                                st.markdown("**Type**")
+                                st.caption(row.get("product_type","") or "—")
+                            with cD:
+                                pid = row.get("product_id","")
+                                st.button(
+                                    "Use",
+                                    key=f"use_{i}_{pid}",
+                                    on_click=_select_pid,
+                                    args=(pid,),
+                                    disabled=(pid == "")
+                                )
+
+                    # Show the exact SQL used
+                    with st.expander("Show SQL"):
+                        st.code(payload.get("display_sql", "--"), language="sql")
+
+        except Exception as e:
+            st.error(f"Search failed: {e}")
+
+    if "just_selected_pid" in st.session_state:
+        sel = st.session_state.pop("just_selected_pid")
+        st.info(f"Selected product_id `{sel}` for Sales/Forecast/Insights tabs.")
+        st.toast(f"Selected product_id `{sel}` for Sales/Forecast/Insights tabs.", icon="✅")
+
+    else:
+        st.info("Enter a query and click **Search**.", icon="🔎")
+
 
 with tab_sales:
     st.subheader("Sales")
@@ -248,8 +323,8 @@ with tab_forecast:
                 )
                 grain_fc = "week"
 
-            show_markers = len(hist) < 200
-            mode_hist = "lines+markers" if show_markers else "lines"
+            # show_markers = len(hist) < 200
+            # mode_hist = "lines+markers" if show_markers else "lines"
 
             # 2) Prepare series for /forecast as [{ds, y}]
             series = [{"ds": d.strftime("%Y-%m-%d"), "y": float(v)}
@@ -269,7 +344,7 @@ with tab_forecast:
                 st.stop()
             fc["ds"] = pd.to_datetime(fc["ds"])
             fc = fc.sort_values("ds")
-            mode_fc   = "lines+markers" if len(fc) < 200 else "lines"
+            # mode_fc = "lines+markers" if len(fc) < 200 else "lines"
 
             # Plotly chart with history + forecast + confidence bands
             color_hist = "#2563EB"   # blue-600
@@ -299,7 +374,7 @@ with tab_forecast:
             if overlay_history:
                 fig.add_trace(go.Scatter(
                     x=hist["period_start"], y=hist[metric_fc],
-                    mode=mode_hist,
+                    mode="lines+markers",
                     name=f"History ({metric_fc})",
                     line=dict(width=2, color=color_hist),
                     marker=dict(size=5, color=color_hist),
@@ -310,7 +385,7 @@ with tab_forecast:
             # Forecast mean
             fig.add_trace(go.Scatter(
                 x=fc["ds"], y=fc["yhat"],
-                mode=mode_fc,
+                mode="lines+markers",
                 name="Forecast",
                 line=dict(width=2, color=color_fc, dash="dash"),
                 marker=dict(size=5, color=color_fc),
