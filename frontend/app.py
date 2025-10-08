@@ -62,8 +62,8 @@ with col2:
         help="FastAPI /health endpoint check"
     )
 
-tab_search, tab_sales, tab_forecast, tab_insights, tab_assistant = st.tabs(
-    ["Search", "Sales", "Forecast", "Insights", "Assistant"]
+tab_search, tab_sales, tab_forecast, tab_insights= st.tabs(
+    ["Search", "Sales", "Forecast", "Insights"]
 )
 
 with tab_search:
@@ -475,13 +475,47 @@ with tab_insights:
                 st.error(f"Request failed: {e}")
     else:
         st.info("Pick a product and click **Generate insights**.", icon="💡")
+    
+    st.divider()
 
-with tab_assistant:
-    st.subheader("Assistant (Agent)")
-    st.caption("Ask end-to-end: ‘Show Nike running shoes last quarter and forecast next month.’")
-    agent_q = st.text_area("Your request", value="", height=80, placeholder="Type a natural-language request…")
-    st.button("Run", key="btn_agent_run")
-    st.info("The /agent/run endpoint will plan tool calls and return results here.", icon="🤖")
+    with st.expander("What-if Simulator", expanded=False):
+        st.caption("Simulate the impact of a pricing or promotion change on sales.")
+        scenario = st.text_input(
+            "Describe a scenario:",
+            key="whatif_scenario",
+            placeholder="e.g., Increase price by 10% or Run a 20% off promo next month",
+        )
+        simulate = st.button("Simulate", key="btn_whatif")
+
+        if simulate:
+            if not pid_i.strip():
+                st.warning("Please select a Product ID first (from Search/Sales).", icon="⚠️")
+            elif not scenario.strip():
+                st.warning("Please describe a scenario.", icon="⚠️")
+            else:
+                body = {
+                    "product_id": pid_i.strip(),
+                    "scenario": scenario.strip(),
+                    "metric": metric_i,
+                    "demo_mode": demo_mode,
+                    "model": model_name,
+                }
+                with st.spinner("Simulating scenario…"):
+                    try:
+                        r = requests.post(f"{backend_url}/llm/whatif", json=body, timeout=60)
+                        if r.ok:
+                            p = r.json()
+                            st.markdown(p.get("answer_md", "_No answer returned._"))
+                            with st.expander("Prompt used"):
+                                st.code(p.get("prompt_used", ""), language="markdown")
+                            st.caption(f"Model: {p.get('model_used', 'unknown')}")
+                        else:
+                            st.error(f"What-if error {r.status_code}: {r.text}")
+                    except Exception as e:
+                        st.error(f"What-if request failed: {e}")
+        else:
+            st.info("Describe a scenario and click **Simulate**.", icon="🔍")
+
 
 st.divider()
 st.caption("© ShopSight 2025")

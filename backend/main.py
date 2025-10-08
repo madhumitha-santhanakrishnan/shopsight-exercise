@@ -114,6 +114,18 @@ class SearchResponse(BaseModel):
     display_sql: str
     rows: list[SearchResponseRow]
 
+class WhatIfRequest(BaseModel):
+    product_id: str
+    scenario: str
+    metric: str = "units"
+    demo_mode: bool = False
+    model: Optional[str] = None
+
+class WhatIfResponse(BaseModel):
+    model_used: str
+    answer_md: str
+    prompt_used: str
+
 def _season_length(grain: str) -> int:
     g = (grain or "week").lower()
     if g == "day":
@@ -572,3 +584,38 @@ def search_products_endpoint(
     rows = [SearchResponseRow(**{k: str(v) if v is not None else "" for k, v in r.items()})
             for r in df.to_dict("records")]
     return SearchResponse(mode=mode, display_sql=pretty_sql(sql, params), rows=rows)
+
+@app.post("/llm/whatif", response_model=WhatIfResponse)
+def whatif(req: WhatIfRequest):
+    """
+    What-if simulator using LLM reasoning.
+    """
+    prompt = f"""
+    You are a retail analyst. The user asks: "{req.scenario}" about {req.metric}.
+    Use business intuition (elasticity, promotions, seasonality) to estimate direction and magnitude.
+    Respond with a concise explanation and 2 bullet outcomes.
+    """
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    model = req.model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    if req.demo_mode or not api_key:
+        mock = f"""
+        If we apply: *{req.scenario}*, expect modest change in {req.metric}.
+        - **Impact:** ±5–10% variation depending on promo elasticity.
+        - **Action:** Run A/B test or regional pilot before scaling.
+        """
+        return WhatIfResponse(model_used="mock", answer_md=mock.strip(), prompt_used=prompt)
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        chat = client.chat.completions.create(
+            model=model,
+            temperature=0.5,
+            messages=[{"role": "system", "content": "Act as a retail strategist."},
+                      {"role": "user", "content": prompt}],
+        )
+        msg = chat.choices[0].message.content.strip()
+        return WhatIfResponse(model_used=model, answer_md=msg, prompt_used=prompt)
+    except Exception as e:
+        return WhatIfResponse(model_used="mock", answer_md=f"Error ({e}). Fallback mock.", prompt_used=prompt)
